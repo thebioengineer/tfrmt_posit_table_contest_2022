@@ -1,0 +1,439 @@
+---
+title: "Posit Table Contest - {tfrmt} Tutorial"
+author: "Ellis Hughes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+## Introduction
+
+In clinical trials the displays that are generated are usually fairly standard, but often need highly specific formatting tweaks (e.g., rounding, footnotes, headers) between studies or to satisfy the various output formats that are required. The standard approaches mean data are rerun and tables regenerated completely.
+
+The {tfrmt} package allows us to define the metadata and expectations of a table _before_ any data is available. This makes those formatting tweaks easy to add while maintaining a base table reference. 
+
+In this tutorial we will demonstrate the features of {tfrmt} given some simulated data!
+
+## Preparation
+
+```{r load-libraries, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(haven)
+library(tfrmt) #installed via remotes::install_github("GSK-Biostatistics/tfrmt")
+library(gt)
+library(gtExtras)
+
+# ARD Created
+primary_tbl <- read_xpt("model.xpt") 
+
+```
+
+To begin we will load `model.xpt` into our environment. This is based completely fake and simulated data and is looking at the impact of a compound against placebo over three visits on FEV1! 
+
+The dataset is in an Analysis Results Data Format (ARD) where each row represents a single data point in the table, and there are columns indicating values such as row group, row label, column label, spanning column label for example. We will not focus on describing the format here, but for more information, view [this presentation](https://www.pharmasug.org/download/sde/rtp2021/PharmaSUG-NCSDE_2021-08.pdf) from CDISC on Analysis Results Standards given at PharmaSUG 2021.
+
+## Build a Primary Results Table
+
+Lets build the table format! 
+
+### Define ARD columns of importance
+
+Lets view the head of `primary_tbl` and determine what the columns are and how they might map to the expected arguments of {tfrmt}!
+
+```{r}
+### Sort out which columns exist, and what they contain
+head(primary_tbl)
+```
+
+Looking at these values and the columns, it looks like:
+
+ - The grouping variable of the rows is `model_results_category` and the actual row labels are `measure`, so `group` is `model_results_category` and `label` is `measure`.
+ - There may be a few ways to group the columns, but there look to be multiple columns and knowing the intended table, visit number is a column label that looks to span across treatments, so the `column` argument will be a vector where `visit` is listed first, then `trt`.
+ - The `param` argument takes the column that defines the value type, which is `param` in this dataset
+ - The `value` argument expects the column with the values, which is `value` in this dataset
+ - Finally, there is a column to indicate order of rows, `ord1` which is what the `sorting_cols` argument accepts.
+ 
+With this information, lets construct the first tfrmt.
+
+```{r}
+
+primary_results_tfrmt <- tfrmt(
+  group = model_results_category,
+  label = measure,
+  column = c(visit, trt),
+  param = param,
+  value = value,
+  sorting_cols = ord1
+)
+
+```
+
+### Define Body Plan - Basics
+
+Next, lets define the formatting of the contents of the table! This is done through a `body_plan()`, which accepts multiple `frmt_structure()`'s. A `frmt_structure()` defines what formatting from `frmt()` or `frmt_combine()` gets applied based on the group, labels, and param. `frmt()` defines rounding and text decoration. `frmt_combine()` identifies which values are to be combined, and which `frmt()` to apply to which values.
+
+Lets see what the params are and their grouping!
+
+```{r}
+
+primary_tbl %>%
+  distinct(param)
+
+primary_tbl %>%
+  dplyr::filter(param != "big_n") %>%
+  dplyr::group_by(trt, measure) %>%
+  dplyr::summarise(
+    param_grp = paste(unique(param), collapse = ", ")
+  )
+
+```
+
+We know that "big_n" will be used elsewhere, so lets create some formating for the rest of the table! We will start by having a default format_structure that will apply to all values. Next, we layer on structures for the "Model Estimates" group, which are all simple formats. Finally, we construct the structures for the "Contrasts" group, where one is a simple format, but the other combines confidence intervals.
+
+```{r}
+
+primary_results_tfrmt_bp <- primary_results_tfrmt %>%
+  tfrmt(
+    body_plan = body_plan(
+
+      ## by default round all values to 2
+      frmt_structure(
+        group_val = ".default",
+        label_val = ".default",
+        frmt("x.xx")
+      ),
+
+      ## For all group "Model Estimates", and labels Adjusted
+      ## Mean/SE apply rounding to 4 decimals and 5 decimals respectively
+      frmt_structure(
+        group_val = "Model Estimates",
+        label_val = "Adjusted Mean",
+        estimate = frmt("x.xxxx")
+      ),
+      frmt_structure(
+        group_val = "Model Estimates",
+        label_val = "SE",
+        std.error = frmt("x.xxxxx")
+      ),
+
+      ## For group value of "Contrast", and label value of
+      ## "Difference", round to 4 decimals
+      frmt_structure(
+        group_val = "Contrast",
+        label_val = "Difference",
+        estimate = frmt("x.xxxx")
+      ),
+
+      ## For group value of "Contrast", and label value of
+      ## "95% CI [high, low]", combine `conf.low` and `conf.high` together,
+      ## rounding to 4 decimals
+      frmt_structure(
+        group_val = "Contrast",
+        label_val = "95% CI [low, high]",
+        frmt_combine("[{conf.low}, {conf.high}]", frmt("x.xxxx"))
+      )
+    )
+  )
+```
+
+Lets see what the table looks like now!
+
+```{r}
+print_to_gt(primary_results_tfrmt_bp, primary_tbl %>% filter(param != "big_n"))
+```
+
+
+### Define Body Plan - Conditional Formatting
+
+Sharp eyes may have noticed we have not applied any formatting to the p.value param. We all know this can be the most important value to format, because there can be a variety of rules around it. 
+
+This is where conditional formatting comes in.
+
+Structured similarly to a `case_when`, thet eft side evaluates comparing against _input_ value to format and the Right side is the frmt or output to be applied to the input value!
+
+```{r}
+conditional_frmt <- frmt_when(
+  ">=10" ~ frmt("xx.x"),
+  ">=1" ~ frmt("x.x"),
+  "<1" ~ frmt("x.xx **"),
+  "TRUE" ~ "MISSING VALUE"
+)
+```
+
+
+Lets apply that formating see how this impacts these values.
+
+```{r}
+
+apply_frmt(
+  frmt_def = conditional_frmt,
+  .data = tibble::tibble(x = c(11,9,2,.005,NA)),
+  value = rlang::quo(x)
+)
+```
+
+Great, the values are all formatted based on where they fell into the frmt_when's conditions. Lets apply a frmt_when to our p.value params and see how the table has now changed.
+
+```{r}
+
+primary_results_tfrmt_bp2 <- primary_results_tfrmt_bp %>%
+  tfrmt(
+    body_plan = body_plan(
+      ## For all groups and labels, conditionally format p.value such that
+      ## when the value is less than .001, display "<0.001", when the
+      ## value is greater than .99, display ">0.99", and otherwise round to
+      ## 3 decimals
+      frmt_structure(
+        group_val = "Contrast",
+        label_val = "p-value",
+        p.value = frmt_when(
+          "<0.001" ~ "<0.001",
+          ">0.99" ~ ">0.99",
+          TRUE ~ frmt("x.xxx")
+          )
+      )
+    )
+  )
+
+
+print_to_gt(primary_results_tfrmt_bp2, primary_tbl %>% filter(param != "big_n"))
+```
+
+
+### Define "Big N's
+
+So we mentioned earier "Big Ns" and how we knew we would be doing something with the values where param "big_n" is defined. Well, in clinical tables it is fairly common to list the number of participants in the column labels, and this is how we do it with {tfrmt}.
+
+using `big_n_structure` we tell {tfrmt} what params identify the "big_n" values and then the formatting we want to apply with `frmt()`.
+
+
+```{r}
+
+primary_results_tfrmt_big_n <- primary_results_tfrmt_bp2 %>%
+  tfrmt(
+    ## define "big N" dressings. Values from s
+    big_n = big_n_structure(
+      param_val = "big_n",
+      n_frmt = frmt("\n(N=XX)")
+    )
+  )
+
+```
+
+Look, now there are big N values in our column labels for each treatment at each visit!
+
+```{r}
+print_to_gt(primary_results_tfrmt_big_n, primary_tbl)
+```
+
+
+### Define the Column Plan
+
+We need to define the column order for which we want things to appear in the table if its different than the order in which they appear in the ARD, which is likely.
+By default all columns (between column columns and actual columns in ARD) are preserved and presented in the table. To drop non-defined columns, set ".drop" in in col_plan to TRUE.
+
+Similar to `dplyr::select()` from tidyverse, `col_plan()` takes unquoted columns (can also optionally pass) as quoted. Behavior is _similar_ too to `dplyr::select()`, but goes with "last identified" model as opposed to "first identified" that tidyselect does. Renaming works similarly.
+
+If you want to define column orders for spanning header content, use the `span_structure()` function. This expects the argname to be the original column name then the values are a vector. Renaming uses named vectors.
+
+What are the potential column names in the data?
+```{r}
+
+primary_tbl %>% filter(param != "big_n") %>% distinct(visit, trt)
+primary_tbl %>% colnames
+
+```
+
+Great, now lets use `col_plan` to tell {tfrmt} what columns we want to use.
+
+```{r}
+primary_results_tfrmt_bp2_cp <- primary_results_tfrmt_big_n %>%
+  tfrmt(
+    ## Define order of columns
+    col_plan = col_plan(
+      model_results_category,
+      measure,
+      span_structure(
+        visit = c(`Week 4`,`Week 8`, `Week 12`),
+        trt = c(`Placebo`,`GSK123456 100 mg`)
+      ),
+      -starts_with("ord")
+    )
+  )
+```
+
+Now lets preview what the table looks like with this ordering set.
+
+```{r}
+print_to_gt(primary_results_tfrmt_bp2_cp, primary_tbl)
+```
+
+### Define Row Group Plan
+
+In addition to plans round column ordering and decoration, sometimes formatting is required for spacing around groups and row label placement
+
+`row_grp_plan()` is a collection of defining how rows will be displayed. `row_grp_structure()` is passed to define how we may style groups and display them. Multiple may be passed to a plan. The `label_loc` argument allows user to define how groups and labels get combined
+
+By default, group labels will be preserved and row labels will be indented but collapsed into a single column.
+
+To insert blank lines beneath groups, we use `row_group_structure()`, indicate which group val we want to style, and what element_block we want to apply (if any).
+
+This example inserts a break beneath the group "Model Estimates".
+
+```{r}
+primary_results_tfrmt_bp2_cp %>%
+  tfrmt(
+    row_grp_plan = row_grp_plan(
+      row_grp_structure(
+        group_val = "Model Estimates",
+        element_block(post_space = "")
+      ),
+      label_loc = element_row_grp_loc(location = "indented") #default behavior
+    )
+  ) %>%
+  print_to_gt(primary_tbl)
+```
+
+You can also add dashed lines instead of white space.
+
+```{r}
+primary_results_tfrmt_bp2_cp %>%
+  tfrmt(
+    row_grp_plan = row_grp_plan(
+      row_grp_structure(
+        group_val = "Model Estimates",
+        element_block(post_space = "-")
+      ),
+      label_loc = element_row_grp_loc(location = "indented") #default behavior
+    )
+  ) %>%
+  print_to_gt(primary_tbl)
+```
+
+### Define footnote plan
+
+A `footnote_plan()` defines the set of footnotes to be added, and contains 1 or more `footnote_structure()`'s, and the mark type to use.
+
+A `footnote_structure()` is used to define:
+
+  - The footnote text
+  - Location of the footnote based on group, label, and columns
+     - specifying one of group, label,  column puts it in the row/column labels
+     - specifying multiple puts it into the table cell
+
+The footnote structure makes it simple to apply footnotes at the various levels of the table by the amount of specificity included. Below we add footnotes at each level.
+         
+```{r}
+primary_results_tfrmt_bp2_cp_fn <- primary_results_tfrmt_bp2_cp %>%
+  tfrmt(
+    footnote_plan = footnote_plan(
+      ## Footnote listed for each group values
+      footnote_structure(
+        "Estimates based on MMRM using an unstructured correlation matrix and allowing distinct variance for each visit",
+        group_val = list(model_results_category = c("Model Estimates","Contrast"))
+      ),
+      
+      ## Footnote listed at the label "p-value" under the "Contrast" group
+      footnote_structure(
+        "Contrasts based on pairwise contrast method with no adjustment",
+        group_val = list(model_results_category = "Contrast"),
+        label_val = list(measure = "p-value")
+      ),
+      
+      ## Footnote in the column labels
+      footnote_structure(
+        "Special footnote to demo calling out a column",
+        column_val = list(visit = "Week 8", trt = "GSK123456 100 mg")
+      ),
+      
+      ## Footnote within the cells of the table
+      footnote_structure(
+        "Special footnote to demo calling out a value",
+        column_val = list(visit = "Week 12", trt = "GSK123456 100 mg"),
+        label_val = list(measure = "p-value")
+      )
+    )
+  )
+```
+
+## Generate Table
+
+With all these values defined in the tfrmt, we can now make our final table!
+
+```{r}
+
+primary_gt <- print_to_gt(primary_results_tfrmt_bp2_cp_fn, primary_tbl)
+
+primary_gt
+
+```
+
+## New Body Plan Components
+
+You may have noticed as we went, that we would pipe in the old tfrmt into a new one. This is because {tfrmt} supports layering. `tfrmts` build up from one another, overwriting values (most cases) or combining (body_plan only). This means you can apply additional styling, say for using scientific notation for  small p-values, without having to re-write the whole tfrmt!
+
+```{r}
+primary_results_tfrmt_alt <- primary_results_tfrmt_bp2_cp_fn %>%
+  tfrmt(
+  # new formatting for p-values
+  body_plan = body_plan(
+    frmt_structure(
+      group_val = "Contrast",
+      label_val = "p-value",
+      p.value = frmt_when(
+        ## styling
+        "<0.001" ~ frmt("x.xxx", scientific = "x10^xx"),
+        ">0.99" ~ ">0.99",
+        TRUE ~ frmt("x.xxx")
+        )
+    )
+  )
+)
+
+primary_gt_alt <- print_to_gt(primary_results_tfrmt_alt, primary_tbl)
+
+primary_gt_alt
+
+```
+
+## {tfrmt} to {gt}
+
+The output format of {tfrmt} is to a {gt}. This means we can take advantage of all the great styling, formatting, and output capabilities that {gt} has.
+
+Here, lets add the guardian theme from {gtExtras}, and color the week 12 p-value.
+
+```{r}
+
+primary_gt_alt_styled <- primary_gt_alt %>%
+  gtExtras::gt_theme_guardian() %>%
+  gt::tab_style(
+    style = cell_text(
+      color = "red",
+      style = "italic"
+    ),
+    locations = cells_body(
+      columns = contains('Week 12'),
+      rows = grepl("p-value", x = measure)
+    )
+  )
+
+primary_gt_alt_styled
+
+```
+
+### Saving The Output
+
+Finally, we need to save the {gt} for downstream use. We can do this by using `gtsave` and our desired output format.
+
+```{r}
+
+primary_gt_alt_styled %>%
+  gtsave(
+    "Primary_Results.docx"
+  )
+
+```
+
+
